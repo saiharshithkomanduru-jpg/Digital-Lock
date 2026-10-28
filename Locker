@@ -1,0 +1,272 @@
+#include <Keypad.h>
+#include <LiquidCrystal.h>
+#include <Servo.h>
+#include <string.h>
+
+// ---------------- LCD ----------------
+LiquidCrystal lcd(12, 11, 10, 9, 8, 7);
+
+// ---------------- Servo ----------------
+#define SERVO_PIN 6
+#define LOCK_POS 20
+#define UNLOCK_POS 90
+
+Servo lockServo;
+
+// ---------------- Buzzer ----------------
+#define BUZZER 13
+
+// ---------------- Keypad ----------------
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] =
+{
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+
+byte rowPins[ROWS] = {5, 4, 3, 2};
+byte colPins[COLS] = {A3, A2, A1, A0};
+
+Keypad keypad = Keypad(
+  makeKeymap(keys), rowPins, colPins, ROWS, COLS
+);
+
+// ---------------- Password & Biometrics ----------------
+const char password[] = "123456789A";
+char entered[11];
+unsigned long pressTimes[10];
+
+int attempts = 0;
+
+// ---------------- Lockout Settings ----------------
+#define LOCKOUT_START 30UL
+#define LOCKOUT_INCREMENT 30UL
+#define LOCKOUT_MAX 3600UL
+
+unsigned long lockoutTime = LOCKOUT_START;
+
+// ---------------- Door Control ----------------
+void lockDoor()
+{
+  lockServo.write(LOCK_POS);
+}
+
+void unlockDoor()
+{
+  lockServo.write(UNLOCK_POS);
+}
+
+// ---------------- Lockout Handler ----------------
+void handleLockout()
+{
+  lcd.clear();
+  lcd.print("SYSTEM LOCKED");
+
+  for (unsigned long i = lockoutTime; i > 0; i--)
+  {
+    lcd.setCursor(0, 1);
+    lcd.print("Wait ");
+    lcd.print(i);
+    lcd.print(" sec     ");
+
+    delay(1000);
+  }
+
+  // Increase the duration for the NEXT lockout
+  if (lockoutTime < LOCKOUT_MAX)
+  {
+    lockoutTime += LOCKOUT_INCREMENT;
+
+    if (lockoutTime > LOCKOUT_MAX)
+    {
+      lockoutTime = LOCKOUT_MAX;
+    }
+  }
+
+  lcd.clear();
+  lcd.print("Lockout Over");
+  delay(1500);
+}
+
+// ---------------- Failed Attempt ----------------
+void wrongPassword(const char* reason, unsigned long deviationScore,
+                   bool showDeviation)
+{
+  attempts++;
+
+  lcd.clear();
+  lcd.print(reason);
+
+  if (showDeviation)
+  {
+    lcd.setCursor(0, 1);
+    lcd.print("Dev: ");
+    lcd.print(deviationScore);
+    lcd.print("ms");
+  }
+
+  digitalWrite(BUZZER, HIGH);
+  delay(1000);
+  digitalWrite(BUZZER, LOW);
+
+  if (attempts >= 3)
+  {
+    attempts = 0;
+    handleLockout();
+  }
+  else
+  {
+    lcd.clear();
+    lcd.print("Attempts Left:");
+    lcd.setCursor(0, 1);
+    lcd.print(3 - attempts);
+    delay(2000);
+  }
+}
+
+// ---------------- Correct Password ----------------
+void correctPassword(unsigned long deviationScore)
+{
+  attempts = 0;
+
+  // Reset lockout duration after successful authentication
+  lockoutTime = LOCKOUT_START;
+
+  lcd.clear();
+  lcd.print("Access Granted");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Dev: ");
+  lcd.print(deviationScore);
+  lcd.print("ms");
+
+  unlockDoor();
+  delay(5000);
+
+  lockDoor();
+
+  lcd.clear();
+  lcd.print("Locker Locked");
+  delay(2000);
+}
+
+// ---------------- Read 10 Keys & Timestamps ----------------
+void readPassword()
+{
+  int index = 0;
+
+  lcd.clear();
+  lcd.print("Enter Password");
+  lcd.setCursor(0, 1);
+
+  while (index < 10)
+  {
+    char key = keypad.getKey();
+
+    if (key != NO_KEY)
+    {
+      pressTimes[index] = millis();
+
+      entered[index] = key;
+
+      lcd.print('*');
+      index++;
+    }
+  }
+
+  entered[10] = '\0';
+}
+
+// ---------------- Keystroke Dynamics Validation ----------------
+unsigned long validateKeystrokeDynamics()
+{
+  const unsigned long refLatencies[9] =
+  {
+    450, 400, 450, 500, 420, 480, 430, 460, 440
+  };
+
+  const unsigned long minAllowedLatency = 60;
+  const unsigned long maxAllowedLatency = 3500;
+
+  unsigned long totalDeviation = 0;
+
+  for (int i = 1; i < 10; i++)
+  {
+    unsigned long latency = pressTimes[i] - pressTimes[i - 1];
+
+    // Reject unusually fast or slow typing
+    if (latency < minAllowedLatency ||
+        latency > maxAllowedLatency)
+    {
+      return 999999UL;
+    }
+
+    // Calculate absolute deviation from reference latency
+    if (latency > refLatencies[i - 1])
+    {
+      totalDeviation += latency - refLatencies[i - 1];
+    }
+    else
+    {
+      totalDeviation += refLatencies[i - 1] - latency;
+    }
+  }
+
+  return totalDeviation;
+}
+
+// ---------------- Compare & Verify ----------------
+void checkPassword()
+{
+  if (strcmp(password, entered) == 0)
+  {
+    unsigned long deviation = validateKeystrokeDynamics();
+
+    Serial.print("Total Deviation Score: ");
+    Serial.println(deviation);
+
+    if (deviation <= 3000)
+    {
+      correctPassword(deviation);
+    }
+    else
+    {
+      wrongPassword("Rhythm Mismatch", deviation, true);
+    }
+  }
+  else
+  {
+    wrongPassword("Wrong Password", 0, false);
+  }
+}
+
+// ---------------- Setup ----------------
+void setup()
+{
+  Serial.begin(9600);
+
+  lcd.begin(16, 2);
+
+  pinMode(BUZZER, OUTPUT);
+  digitalWrite(BUZZER, LOW);
+
+  lockServo.attach(SERVO_PIN);
+  lockDoor();
+
+  lcd.print("Electronic");
+  lcd.setCursor(0, 1);
+  lcd.print("Security Locker");
+
+  delay(2000);
+}
+
+// ---------------- Main Loop ----------------
+void loop()
+{
+  readPassword();
+  checkPassword();
+}
